@@ -1379,6 +1379,285 @@ async def custom_tts_endpoint(
         io.BytesIO(encoded_audio_bytes), media_type=media_type, headers=headers
     )
 
+
+MAX_SRT_FILE_BYTES = 5 * 1024 * 1024  # 5 MB is far larger than any legitimate SRT file
+MAX_SRT_ENTRIES = 2000  # Safety cap on subtitles processed per request
+MAX_FIT_TO_SLOT_STRETCH = 2.0  # Cap for per-subtitle speed-up when fit_to_slot is enabled
+
+
+@app.post(
+    "/tts/srt",
+    tags=["TTS Generation"],
+    summary="Generate timestamp-aligned (dubbed) speech from an SRT subtitle file",
+    responses={
+        200: {
+            "content": {"audio/wav": {}, "audio/opus": {}, "audio/mp3": {}},
+            "description": "Successful audio generation. Each subtitle's speech starts at its SRT timestamp; gaps are silence.",
+        },
+        400: {"model": ErrorResponse, "description": "Invalid SRT file or request parameters."},
+        404: {"model": ErrorResponse, "description": "Required voice file not found."},
+        500: {"model": ErrorResponse, "description": "Internal server error during generation."},
+        503: {"model": ErrorResponse, "description": "TTS engine not available or model not loaded."},
+    },
+)
+async def srt_tts_endpoint(
+    srt_file: UploadFile = File(..., description="SRT subtitle file to synthesize."),
+    voice_mode: Literal["predefined", "clone"] = Form("predefined"),
+    predefined_voice_id: Optional[str] = Form(None),
+    reference_audio_filename: Optional[str] = Form(None),
+    fit_to_slot: bool = Form(
+        False,
+        description="If true, speed up speech that would overflow its subtitle time slot (capped at 2x).",
+    ),
+    output_format: Optional[Literal["wav", "opus", "mp3"]] = Form("wav"),
+    temperature: Optional[float] = Form(None),
+    exaggeration: Optional[float] = Form(None),
+    cfg_weight: Optional[float] = Form(None),
+    seed: Optional[int] = Form(None),
+    speed_factor: Optional[float] = Form(None),
+    language: Optional[str] = Form(None),
+):
+    """
+    Generates a single dubbed audio track from an uploaded SRT subtitle file.
+    Each subtitle's speech is placed at its SRT start timestamp on the timeline,
+    with silence filling the gaps, so the output stays in sync with video.
+    Overlapping speech (when a line is longer than its slot) is mixed additively;
+    enable `fit_to_slot` to time-stretch overflowing lines instead.
+    """
+    if not engine.MODEL_LOADED:
+        logger.error("SRT TTS request failed: Model not loaded.")
+        raise HTTPException(
+            status_code=503,
+            detail="TTS engine model is not currently loaded or available.",
+        )
+
+    try:
+        # --- Read and parse the SRT file ---
+        raw_srt = await srt_file.read()
+        if not raw_srt:
+            raise HTTPException(status_code=400, detail="Uploaded SRT file is empty.")
+        if len(raw_srt) > MAX_SRT_FILE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"SRT file too large ({len(raw_srt)} bytes, max {MAX_SRT_FILE_BYTES}).",
+            )
+        try:
+            srt_content = raw_srt.decode("utf-8-sig", errors="replace")
+            subtitle_entries = utils.parse_srt(srt_content)
+        except ValueError as e_parse:
+            raise HTTPException(status_code=400, detail=f"Invalid SRT file: {e_parse}")
+        if len(subtitle_entries) > MAX_SRT_ENTRIES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"SRT contains {len(subtitle_entries)} subtitles (max {MAX_SRT_ENTRIES}).",
+            )
+        logger.info(
+            f"Received /tts/srt request: file='{srt_file.filename}', "
+            f"{len(subtitle_entries)} subtitles, mode='{voice_mode}', fit_to_slot={fit_to_slot}"
+        )
+
+        # --- Resolve voice (same rules as /tts) ---
+        audio_prompt_path_for_engine: Optional[Path] = None
+        if voice_mode == "predefined":
+            if not predefined_voice_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Missing 'predefined_voice_id' for 'predefined' voice mode.",
+                )
+            voices_dir = get_predefined_voices_path(ensure_absolute=True)
+            try:
+                potential_path = utils.safe_resolve_within(voices_dir, predefined_voice_id)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid predefined voice ID.")
+            if not potential_path.is_file():
+                logger.error(f"Predefined voice file not found: {potential_path}")
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Predefined voice file '{predefined_voice_id}' not found.",
+                )
+            audio_prompt_path_for_engine = potential_path
+            logger.info(f"Using predefined voice: {predefined_voice_id}")
+
+        elif voice_mode == "clone":
+            if not reference_audio_filename:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Missing 'reference_audio_filename' for 'clone' voice mode.",
+                )
+            ref_dir = get_reference_audio_path(ensure_absolute=True)
+            try:
+                potential_path = utils.safe_resolve_within(ref_dir, reference_audio_filename)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid reference audio filename.")
+            if not potential_path.is_file():
+                logger.error(f"Reference audio file for cloning not found: {potential_path}")
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Reference audio file '{reference_audio_filename}' not found.",
+                )
+            max_dur = config_manager.get_int("audio_output.max_reference_duration_sec", 30)
+            is_valid, msg = utils.validate_reference_audio(potential_path, max_dur)
+            if not is_valid:
+                raise HTTPException(status_code=400, detail=f"Invalid reference audio: {msg}")
+            audio_prompt_path_for_engine = potential_path
+            logger.info(f"Using reference audio for cloning: {reference_audio_filename}")
+
+        audio_prompt_str = (
+            str(audio_prompt_path_for_engine) if audio_prompt_path_for_engine else None
+        )
+        temperature_val = temperature if temperature is not None else get_gen_default_temperature()
+        exaggeration_val = exaggeration if exaggeration is not None else get_gen_default_exaggeration()
+        cfg_weight_val = cfg_weight if cfg_weight is not None else get_gen_default_cfg_weight()
+        seed_val = seed if seed is not None else get_gen_default_seed()
+        speed_factor_val = speed_factor if speed_factor is not None else get_gen_default_speed_factor()
+        language_val = language if language is not None else get_gen_default_language()
+
+        # --- Synthesize each subtitle ---
+        loop = asyncio.get_running_loop()
+        engine_output_sample_rate: Optional[int] = None
+        placed_segments: List[tuple] = []  # (start_sec, audio_np)
+
+        for i, (start_sec, end_sec, text) in enumerate(subtitle_entries):
+            logger.info(f"Synthesizing subtitle {i+1}/{len(subtitle_entries)}: '{text[:60]}'")
+            try:
+                audio_tensor, entry_sr = await loop.run_in_executor(
+                    None,
+                    lambda t=text: engine.synthesize(
+                        text=t,
+                        audio_prompt_path=audio_prompt_str,
+                        temperature=temperature_val,
+                        exaggeration=exaggeration_val,
+                        cfg_weight=cfg_weight_val,
+                        seed=seed_val,
+                        language=language_val,
+                    ),
+                )
+            except Exception as e_synth:
+                error_detail = f"Error synthesizing subtitle {i+1}: {str(e_synth)}"
+                logger.error(error_detail, exc_info=True)
+                raise HTTPException(status_code=500, detail=error_detail)
+
+            if audio_tensor is None or entry_sr is None:
+                error_detail = f"TTS engine failed to synthesize audio for subtitle {i+1}."
+                logger.error(error_detail)
+                raise HTTPException(status_code=500, detail=error_detail)
+
+            if engine_output_sample_rate is None:
+                engine_output_sample_rate = entry_sr
+
+            audio_np = np.atleast_1d(
+                audio_tensor.cpu().numpy().squeeze().astype(np.float32)
+            )
+
+            # Trim lead/trail silence so speech onset aligns with the SRT timestamp
+            # and the slot measurement below reflects actual speech, not engine padding.
+            audio_np = utils.trim_lead_trail_silence(audio_np, entry_sr)
+
+            # All speed changes here use WSOLA (audiotsm): phase-vocoder stretching
+            # (librosa, used by utils.apply_speed_factor) adds audible echo artifacts to speech.
+            if speed_factor_val != 1.0:
+                audio_np = utils.apply_speed_factor_wsola(audio_np, speed_factor_val)
+
+            slot_duration = end_sec - start_sec
+            if fit_to_slot and slot_duration > 0:
+                speech_duration = len(audio_np) / entry_sr
+                if speech_duration > slot_duration:
+                    stretch = min(speech_duration / slot_duration, MAX_FIT_TO_SLOT_STRETCH)
+                    logger.info(
+                        f"Subtitle {i+1}/{len(subtitle_entries)}: speech {speech_duration:.2f}s "
+                        f"exceeds slot {slot_duration:.2f}s; applying {stretch:.2f}x WSOLA stretch "
+                        f"(text: '{text[:60]}')"
+                    )
+                    audio_np = utils.apply_speed_factor_wsola(audio_np, stretch)
+
+            placed_segments.append((start_sec, audio_np))
+
+        if not placed_segments or engine_output_sample_rate is None:
+            raise HTTPException(
+                status_code=500, detail="Audio generation resulted in no output."
+            )
+
+        # --- Assemble timestamp-aligned timeline ---
+        sr = engine_output_sample_rate
+        last_subtitle_end = max(end for _, end, _ in subtitle_entries)
+        total_samples = int(last_subtitle_end * sr)
+        for start_sec, seg in placed_segments:
+            total_samples = max(total_samples, int(start_sec * sr) + len(seg))
+        total_samples += sr  # 1s tail padding
+
+        timeline = np.zeros(total_samples, dtype=np.float32)
+        overflow_count = 0
+        for idx, (start_sec, seg) in enumerate(placed_segments):
+            pos = int(start_sec * sr)
+            timeline[pos : pos + len(seg)] += seg
+            if idx + 1 < len(placed_segments):
+                next_start = placed_segments[idx + 1][0]
+                if start_sec + len(seg) / sr > next_start:
+                    overflow_count += 1
+        if overflow_count:
+            logger.warning(
+                f"{overflow_count} subtitle(s) have speech longer than their time slot; "
+                f"overlapping audio was mixed. Consider fit_to_slot=true."
+            )
+
+        peak = float(np.max(np.abs(timeline))) if timeline.size else 0.0
+        if peak > 0.99:
+            timeline *= 0.95 / peak
+
+        # --- Encode and respond ---
+        output_format_str = output_format if output_format else get_audio_output_format()
+        final_output_sample_rate = get_audio_sample_rate()
+        encoded_audio_bytes = utils.encode_audio(
+            audio_array=timeline,
+            sample_rate=sr,
+            output_format=output_format_str,
+            target_sample_rate=final_output_sample_rate,
+        )
+        if encoded_audio_bytes is None or len(encoded_audio_bytes) < 100:
+            logger.error(
+                f"Failed to encode SRT dubbing audio to format: {output_format_str} "
+                f"or output is too small ({len(encoded_audio_bytes or b'')} bytes)."
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to encode audio to {output_format_str} or generated invalid audio.",
+            )
+
+        timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+        srt_stem = Path(utils.sanitize_filename(srt_file.filename or "subtitles")).stem
+        download_filename = utils.sanitize_filename(
+            f"{srt_stem}_dubbed_{timestamp_str}.{output_format_str}"
+        )
+        headers = {"Content-Disposition": f'attachment; filename="{download_filename}"'}
+        logger.info(
+            f"Successfully generated SRT dubbing: {download_filename}, "
+            f"{len(encoded_audio_bytes)} bytes, {total_samples / sr:.2f}s timeline."
+        )
+
+        # Optional: Save to disk if enabled
+        if config_manager.get_bool("audio_output.save_to_disk", False):
+            output_dir = get_output_path(ensure_absolute=True)
+            output_file_path = output_dir / download_filename
+            try:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                with open(output_file_path, "wb") as f:
+                    f.write(encoded_audio_bytes)
+                logger.info(f"Audio saved to disk: {output_file_path}")
+            except Exception as e:
+                logger.error(f"Failed to save audio to {output_file_path}: {e}", exc_info=True)
+                raise HTTPException(
+                    status_code=500, detail=f"Failed to save audio file: {e}"
+                )
+
+        return StreamingResponse(
+            io.BytesIO(encoded_audio_bytes),
+            media_type=f"audio/{output_format_str}",
+            headers=headers,
+        )
+    finally:
+        await srt_file.close()
+
+
 @app.get("/v1/audio/voices", tags=["llama-swap Compatible"])
 # llama-swap, koboldcpp, and probably some more use this
 async def openai_voices_endpoint(model: str = ""):

@@ -955,19 +955,22 @@ a.btn.disabled {
      11. Voice Mode Selector
      ============================================ */
 
-.voice-mode {
+.voice-mode,
+.input-source {
     display: grid;
     grid-template-columns: 1fr;
     gap: var(--space-4);
 }
 
 @media (min-width: 768px) {
-    .voice-mode {
+    .voice-mode,
+    .input-source {
         grid-template-columns: repeat(2, 1fr);
     }
 }
 
-.voice-mode__option {
+.voice-mode__option,
+.input-source__option {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -982,30 +985,35 @@ a.btn.disabled {
     transition: all var(--transition-normal);
 }
 
-.voice-mode__option:hover {
+.voice-mode__option:hover,
+.input-source__option:hover {
     border-color: var(--color-border-accent);
     background-color: var(--color-bg-surface-alt);
 }
 
-.voice-mode__option.selected {
+.voice-mode__option.selected,
+.input-source__option.selected {
     border-color: var(--color-primary);
     background-color: var(--color-bg-accent);
     color: var(--color-primary);
     box-shadow: 0 0 0 1px var(--color-primary);
 }
 
-.dark .voice-mode__option {
+.dark .voice-mode__option,
+.dark .input-source__option {
     background-color: var(--color-bg-surface);
     border-color: var(--color-border-default);
     color: var(--color-text-muted);
 }
 
-.dark .voice-mode__option:hover {
+.dark .voice-mode__option:hover,
+.dark .input-source__option:hover {
     background-color: var(--color-bg-surface-alt);
     border-color: var(--color-text-muted);
 }
 
-.dark .voice-mode__option.selected {
+.dark .voice-mode__option.selected,
+.dark .input-source__option.selected {
     background-color: var(--color-bg-accent);
     border-color: var(--color-primary);
     color: #a5b4fc;

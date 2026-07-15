@@ -41,6 +41,22 @@ except ImportError:
         "and pitch-preserving speed adjustment will be limited. Speed adjustment will fall back to basic method if enabled."
     )
 
+# Optional import for audiotsm (WSOLA time-scale modification — echo-free speech stretching)
+try:
+    from audiotsm import wsola as _audiotsm_wsola
+    from audiotsm.io.array import (
+        ArrayReader as _TsmArrayReader,
+        ArrayWriter as _TsmArrayWriter,
+    )
+
+    AUDIOTSM_AVAILABLE = True
+    logger.info(
+        "audiotsm library found; WSOLA time-stretching available (echo-free speech speed changes)."
+    )
+except ImportError:
+    AUDIOTSM_AVAILABLE = False
+    logger.warning("audiotsm library not found. WSOLA time-stretching will be unavailable.")
+
 # Optional import for Parselmouth (for unvoiced segment detection)
 try:
     import parselmouth
@@ -577,6 +593,61 @@ def apply_speed_factor(
         return audio_tensor, sample_rate
 
 
+def apply_speed_factor_wsola(audio_array: np.ndarray, speed_factor: float) -> np.ndarray:
+    """
+    Applies a speed factor to a NumPy audio array using WSOLA (Waveform Similarity
+    Overlap-Add) time-scale modification. Unlike phase-vocoder stretching
+    (librosa.effects.time_stretch), WSOLA preserves pitch without introducing
+    echo/watery artifacts, making it preferable for speech dubbing.
+
+    Args:
+        audio_array: 1D mono NumPy array (float32) of audio.
+        speed_factor: Desired speed factor (>1 is faster/shorter, <1 is slower/longer).
+
+    Returns:
+        Speed-adjusted float32 NumPy array. Returns the original array if audiotsm
+        is unavailable, the factor is ~1.0 or invalid, the clip is too short, or on error.
+    """
+    if audio_array is None or audio_array.size == 0:
+        return audio_array
+    if abs(speed_factor - 1.0) < 1e-3:
+        return audio_array
+    if speed_factor <= 0:
+        logger.warning(
+            f"Invalid speed_factor {speed_factor}. Must be positive. Returning original audio."
+        )
+        return audio_array
+    if not AUDIOTSM_AVAILABLE:
+        logger.warning(
+            "audiotsm not available for WSOLA speed adjustment. Returning original audio."
+        )
+        return audio_array
+
+    try:
+        mono = np.ascontiguousarray(audio_array.squeeze(), dtype=np.float32)
+        if mono.ndim != 1:
+            mono = mono.flatten()
+        if mono.size < 2048:  # Too short for WSOLA's analysis frames; leave untouched.
+            logger.debug("Clip too short for WSOLA; returning original audio.")
+            return audio_array
+
+        reader = _TsmArrayReader(mono.reshape(1, -1))
+        writer = _TsmArrayWriter(1)
+        _audiotsm_wsola(1, speed=float(speed_factor)).run(reader, writer)
+        stretched = writer.data[0].astype(np.float32)
+        logger.info(
+            f"Applied speed factor {speed_factor:.4g} using audiotsm WSOLA: "
+            f"{len(mono)} -> {len(stretched)} samples."
+        )
+        return stretched
+    except Exception as e_wsola:
+        logger.error(
+            f"WSOLA speed adjustment failed: {e_wsola}. Returning original audio.",
+            exc_info=True,
+        )
+        return audio_array
+
+
 def trim_lead_trail_silence(
     audio_array: np.ndarray,
     sample_rate: int,
@@ -1093,6 +1164,63 @@ def chunk_text_by_sentences(
 
     logger.info(f"Text chunking complete. Generated {len(text_chunks)} chunk(s).")
     return text_chunks
+
+
+# --- SRT Parsing ---
+_SRT_TIMESTAMP_RE = re.compile(
+    r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*"
+    r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})"
+)
+_SRT_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _srt_ts_to_seconds(h: str, m: str, s: str, ms: str) -> float:
+    """Converts SRT timestamp parts to seconds (millisecond part is right-padded to 3 digits)."""
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms.ljust(3, "0")[:3]) / 1000.0
+
+
+def parse_srt(content: str) -> List[Tuple[float, float, str]]:
+    """
+    Parses SRT subtitle content into a list of (start_sec, end_sec, text) tuples,
+    sorted by start time. Multi-line subtitle text is joined with spaces and
+    simple HTML-like tags (e.g. <i>, <font>) are stripped.
+
+    Args:
+        content: Raw text content of an .srt file.
+
+    Returns:
+        List of (start_seconds, end_seconds, text) tuples with non-empty text.
+
+    Raises:
+        ValueError: If no valid subtitle entries with text are found.
+    """
+    if not content or not content.strip():
+        raise ValueError("SRT content is empty.")
+
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    entries: List[Tuple[float, float, str]] = []
+
+    for block in re.split(r"\n\s*\n", normalized):
+        lines = [ln.strip() for ln in block.split("\n")]
+        ts_line_idx = next(
+            (i for i, ln in enumerate(lines) if _SRT_TIMESTAMP_RE.search(ln)), None
+        )
+        if ts_line_idx is None:
+            continue
+        match = _SRT_TIMESTAMP_RE.search(lines[ts_line_idx])
+        start = _srt_ts_to_seconds(*match.group(1, 2, 3, 4))
+        end = _srt_ts_to_seconds(*match.group(5, 6, 7, 8))
+        text = " ".join(ln for ln in lines[ts_line_idx + 1 :] if ln)
+        text = _SRT_TAG_RE.sub("", text).strip()
+        if text:
+            entries.append((start, max(end, start), text))
+
+    if not entries:
+        raise ValueError("No valid subtitle entries with text found in SRT content.")
+
+    entries.sort(key=lambda e: e[0])
+    logger.info(f"Parsed {len(entries)} subtitle entries from SRT content.")
+    return entries
 
 
 # --- File System Utilities ---

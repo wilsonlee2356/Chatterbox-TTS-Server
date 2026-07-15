@@ -27,6 +27,7 @@ document.addEventListener('DOMContentLoaded', async function () {
     let hideChunkWarning = false;
     let hideGenerationWarning = false;
     let currentVoiceMode = 'predefined';
+    let currentInputSource = 'text';
 
     const IS_LOCAL_FILE = window.location.protocol === 'file:';
     // If you always access the server via localhost
@@ -105,6 +106,13 @@ document.addEventListener('DOMContentLoaded', async function () {
     const languageSelectContainer = document.getElementById('language-select-container');
     const languageSelect = document.getElementById('language');
     const outputFormatSelect = document.getElementById('output-format');
+    const inputSourceRadios = document.querySelectorAll('input[name="input_source"]');
+    const inputSourceOptions = document.querySelectorAll('.input-source__option');
+    const textInputGroup = document.getElementById('text-input-group');
+    const srtInputGroup = document.getElementById('srt-input-group');
+    const srtFileInput = document.getElementById('srt-file-input');
+    const fitToSlotToggle = document.getElementById('fit-to-slot-toggle');
+    const splitTextLabel = document.getElementById('split-text-label');
     const saveGenDefaultsBtn = document.getElementById('save-gen-defaults-btn');
     const genDefaultsStatus = document.getElementById('gen-defaults-status');
     const serverConfigForm = document.getElementById('server-config-form');
@@ -932,6 +940,39 @@ document.addEventListener('DOMContentLoaded', async function () {
     }
     voiceModeRadios.forEach(radio => radio.addEventListener('change', toggleVoiceOptionsDisplay));
 
+    // --- Input Source (Text vs SRT) Visibility ---
+    function toggleInputSourceDisplay() {
+        const selected = document.querySelector('input[name="input_source"]:checked')?.value || 'text';
+        currentInputSource = selected;
+        const isSrt = selected === 'srt';
+        if (textInputGroup) textInputGroup.classList.toggle('hidden', isSrt);
+        if (srtInputGroup) srtInputGroup.classList.toggle('hidden', !isSrt);
+        if (textArea) textArea.required = !isSrt;
+        // Split/chunk controls only apply to plain text input.
+        if (isSrt) {
+            if (splitTextLabel) splitTextLabel.classList.add('hidden');
+            if (chunkSizeControls) chunkSizeControls.classList.add('hidden');
+            if (chunkExplanation) chunkExplanation.classList.add('hidden');
+        } else {
+            if (splitTextLabel) splitTextLabel.classList.remove('hidden');
+            // Restore chunk controls according to the split toggle's own logic.
+            if (splitTextToggle) splitTextToggle.dispatchEvent(new Event('change'));
+        }
+        // Paralinguistic tag buttons insert into the textarea, so they only apply to text input.
+        if (paralinguisticTagsSection) {
+            const modelSupportsTags = currentModelInfo?.type === 'turbo' && currentModelInfo?.supports_paralinguistic_tags;
+            paralinguisticTagsSection.classList.toggle('hidden', isSrt || !modelSupportsTags);
+        }
+    }
+    inputSourceRadios.forEach(radio => {
+        radio.addEventListener('change', function () {
+            inputSourceOptions.forEach(option => option.classList.remove('selected'));
+            const selectedOption = this.closest('.input-source__option');
+            if (selectedOption) selectedOption.classList.add('selected');
+        });
+        radio.addEventListener('change', toggleInputSourceDisplay);
+    });
+
     function toggleChunkControlsVisibility() {
         const isChecked = splitTextToggle ? splitTextToggle.checked : false;
         if (chunkSizeControls) chunkSizeControls.classList.toggle('hidden', !isChecked);
@@ -1114,7 +1155,61 @@ document.addEventListener('DOMContentLoaded', async function () {
         }
     }
 
+    async function submitSRTRequest() {
+        isGenerating = true;
+        showLoadingOverlay();
+        const startTime = performance.now();
+        const formData = new FormData();
+        formData.append('srt_file', srtFileInput.files[0]);
+        formData.append('voice_mode', currentVoiceMode);
+        if (currentVoiceMode === 'predefined' && predefinedVoiceSelect.value !== 'none') {
+            formData.append('predefined_voice_id', predefinedVoiceSelect.value);
+        } else if (currentVoiceMode === 'clone' && cloneReferenceSelect.value !== 'none') {
+            formData.append('reference_audio_filename', cloneReferenceSelect.value);
+        }
+        formData.append('fit_to_slot', fitToSlotToggle && fitToSlotToggle.checked ? 'true' : 'false');
+        formData.append('output_format', outputFormatSelect.value || 'mp3');
+        formData.append('temperature', temperatureSlider.value);
+        formData.append('exaggeration', exaggerationSlider.value);
+        formData.append('cfg_weight', cfgWeightSlider.value);
+        formData.append('speed_factor', speedFactorSlider.value);
+        formData.append('seed', seedInput.value);
+        formData.append('language', languageSelect.value);
+        try {
+            const response = await fetch(`${API_BASE_URL}/tts/srt`, {
+                method: 'POST',
+                body: formData
+            });
+            if (!response.ok) {
+                const errorResult = await response.json().catch(() => ({ detail: `HTTP error ${response.status}` }));
+                throw new Error(formatErrorDetail(errorResult.detail) || 'SRT dubbing generation failed.');
+            }
+            const audioBlob = await response.blob();
+            const endTime = performance.now();
+            const genTime = ((endTime - startTime) / 1000).toFixed(2);
+            const filenameFromServer = response.headers.get('Content-Disposition')?.split('filename=')[1]?.replace(/"/g, '') || 'dubbed_audio.wav';
+            const resultDetails = {
+                outputUrl: URL.createObjectURL(audioBlob), filename: filenameFromServer, genTime: genTime,
+                submittedVoiceMode: currentVoiceMode,
+                submittedPredefinedVoice: currentVoiceMode === 'predefined' ? predefinedVoiceSelect.value : undefined,
+                submittedCloneFile: currentVoiceMode === 'clone' ? cloneReferenceSelect.value : undefined
+            };
+            initializeWaveSurfer(resultDetails.outputUrl, resultDetails);
+            showNotification('Dubbed audio generated successfully!', 'success');
+        } catch (error) {
+            console.error('SRT Dubbing Error:', error);
+            showNotification(error.message || 'An unknown error occurred during SRT dubbing generation.', 'error');
+        } finally {
+            isGenerating = false;
+            hideLoadingOverlay();
+        }
+    }
+
     function proceedWithSubmissionChecks() {
+        if (currentInputSource === 'srt') {
+            submitSRTRequest();
+            return;
+        }
         const textContent = textArea.value.trim();
         const isSplittingEnabled = splitTextToggle.checked;
         const currentChunkSz = parseInt(chunkSizeSlider.value, 10);
@@ -1142,10 +1237,17 @@ document.addEventListener('DOMContentLoaded', async function () {
                 showNotification("Generation is already in progress.", "warning");
                 return;
             }
-            const textContent = textArea.value.trim();
-            if (!textContent) {
-                showNotification("Please enter some text to generate speech.", 'error');
-                return;
+            if (currentInputSource === 'srt') {
+                if (!srtFileInput || !srtFileInput.files || srtFileInput.files.length === 0) {
+                    showNotification("Please select an SRT subtitle file.", 'error');
+                    return;
+                }
+            } else {
+                const textContent = textArea.value.trim();
+                if (!textContent) {
+                    showNotification("Please enter some text to generate speech.", 'error');
+                    return;
+                }
             }
             if (currentVoiceMode === 'predefined' && (!predefinedVoiceSelect || predefinedVoiceSelect.value === 'none')) {
                 showNotification("Please select a predefined voice.", 'error');

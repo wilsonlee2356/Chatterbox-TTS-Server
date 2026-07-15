@@ -1103,6 +1103,7 @@ The primary endpoint for TTS generation is `/tts`. The OpenAI-compatible `/v1/au
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/tts` | POST | Custom TTS, full param set, supports `stream: true` (mp3 / wav / opus) |
+| `/tts/srt` | POST | Timestamp-aligned dubbing from an uploaded SRT subtitle file (mp3 / wav / opus) |
 | `/v1/audio/speech` | POST | OpenAI-compatible TTS |
 | `/v1/audio/voices` | GET | OpenAI-compatible voice listing |
 | `/api/ui/initial-data` | GET | UI bootstrap + comprehensive health check |
@@ -1137,6 +1138,22 @@ curl -X POST http://localhost:8004/tts \
   -H "Content-Type: application/json" \
   -d '{"text":"The first chunk arrives quickly, the rest stream behind.","stream":true}' \
   --output stream.wav
+```
+
+**SRT dubbing (`POST /tts/srt`, multipart form):** upload an SRT subtitle file and get back a single audio track where each subtitle's speech starts at its SRT timestamp, with silence filling the gaps — so the output stays in sync with video. Also available in the Web UI by switching **Input Source** to **SRT File (Dubbing)**.
+
+- `srt_file` (file, required) — the `.srt` subtitle file (max 5 MB / 2000 subtitles).
+- `voice_mode`, `predefined_voice_id`, `reference_audio_filename` — same voice selection as `/tts`.
+- `fit_to_slot` (boolean, default `false`) — speed up speech that would overflow its subtitle time slot (capped at 2x) using echo-free WSOLA time-scaling. When `false`, overflowing speech is mixed into the following audio instead.
+- `output_format`, `temperature`, `exaggeration`, `cfg_weight`, `seed`, `speed_factor`, `language` — same generation parameters as `/tts`.
+
+```bash
+curl -X POST http://localhost:8004/tts/srt \
+  -F "srt_file=@subtitles.srt" \
+  -F "voice_mode=predefined" \
+  -F "predefined_voice_id=Abigail.wav" \
+  -F "fit_to_slot=true" \
+  --output dubbed.wav
 ```
 # 🐳 Docker Installation
 

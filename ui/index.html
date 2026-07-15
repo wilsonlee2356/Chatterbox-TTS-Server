@@ -84,6 +84,20 @@
                             </div>
 
                             <div class="form-group">
+                                <label class="form-label mb-2">Input Source:</label>
+                                <div class="input-source">
+                                    <label class="input-source__option selected" data-mode="text">
+                                        <input type="radio" name="input_source" value="text" class="hidden" checked>
+                                        <span>Text</span>
+                                    </label>
+                                    <label class="input-source__option" data-mode="srt">
+                                        <input type="radio" name="input_source" value="srt" class="hidden">
+                                        <span>SRT File (Dubbing)</span>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div class="form-group" id="text-input-group">
                                 <label for="text" class="form-label">Text to synthesize</label>
                                 <p class="form-hint mb-2">
                                     Enter the text you want to convert to speech. For audiobooks, you can paste long
@@ -96,6 +110,26 @@
                                         <span id="char-count">0</span> Characters
                                     </div>
                                 </div>
+                            </div>
+
+                            <div id="srt-input-group" class="form-group hidden">
+                                <label for="srt-file-input" class="form-label">SRT subtitle file</label>
+                                <p class="form-hint mb-2">
+                                    Upload a <code class="code">.srt</code> file to generate a timestamp-aligned
+                                    dubbed track: each subtitle's speech starts at its timestamp and gaps are
+                                    filled with silence, so the audio stays in sync with video.
+                                </p>
+                                <input type="file" id="srt-file-input" name="srt_file" accept=".srt"
+                                    class="form-input">
+                                <label for="fit-to-slot-toggle" class="checkbox-label mt-2">
+                                    <input type="checkbox" id="fit-to-slot-toggle" name="fit_to_slot"
+                                        class="form-checkbox">
+                                    <span>Fit speech to time slots</span>
+                                </label>
+                                <p class="form-hint">
+                                    When enabled, speech longer than its subtitle time slot is sped up (max 2x)
+                                    to fit, instead of overlapping the next line.
+                                </p>
                             </div>
 
                             <!-- Paralinguistic Tags Section (Turbo only) -->
@@ -134,7 +168,7 @@
                                     </svg>
                                     Generate Speech
                                 </button>
-                                <label for="split-text-toggle" class="checkbox-label">
+                                <label for="split-text-toggle" id="split-text-label" class="checkbox-label">
                                     <input type="checkbox" id="split-text-toggle" name="split_text"
                                         class="form-checkbox">
                                     <span>Split text into chunks</span>

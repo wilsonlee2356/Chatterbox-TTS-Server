@@ -49,3 +49,6 @@ htmlcov/
 
 # Local-only scratch / notes (never committed)
 _local/
+
+# Ignore local embedded Python runtime (Windows dev convenience)
+python_embedded/

@@ -5,13 +5,15 @@ server:
   use_auth: false
   auth_username: user
   auth_password: password
-  log_file_path: logs/tts_server.log
+  log_file_path: logs\tts_server.log
   log_file_max_size_mb: 10
   log_file_backup_count: 5
+  ssl_certfile: null
+  ssl_keyfile: null
 model:
   repo_id: chatterbox-turbo
 tts_engine:
-  device: auto
+  device: cpu
   predefined_voices_path: voices
   reference_audio_path: reference_audio
   default_voice_id: Emily.wav
@@ -50,14 +52,14 @@ ui_state:
     freedom! [sniff] That or more of Kevin''s cologne!
 
     '
-  last_voice_mode: predefined
+  last_voice_mode: clone
   last_predefined_voice: Emily.wav
   last_reference_file: Gianna.wav
   last_seed: 3000
   last_chunk_size: 240
   last_split_text_enabled: true
   hide_chunk_warning: false
-  hide_generation_warning: false
+  hide_generation_warning: true
   theme: light
   last_preset_name: "\u26A1 Turbo: Escape Room Panic"
 ui:
